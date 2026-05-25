@@ -37,7 +37,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 # ─────────────────────────────────────────────────────────────────────────────
 # Config
 # ─────────────────────────────────────────────────────────────────────────────
-DATA_PATH = Path("/mnt/user-data/uploads/wearable_cvd_synthetic_dataset.xlsx")
+DATA_PATH = Path("/wearable_cvd_synthetic_dataset.xlsx")
 SEQ_LEN = 7          # days of history fed to the CNN
 EMBED_DIM = 4        # small embedding → summarises, doesn't crowd out tabular signal
 NN_EPOCHS = 60       # upper bound; early stopping decides actual epoch count
@@ -54,7 +54,14 @@ np.random.seed(RANDOM_STATE)
 # 1. Load and merge
 # ─────────────────────────────────────────────────────────────────────────────
 def load_dataset(path: Path) -> pd.DataFrame:
-    """Join the three relevant sheets into one (participant_id, date) row table."""
+    """
+    Load and merge all source sheets into one modeling table.
+
+    The final grain is one row per (participant_id, date), so each daily wearable
+    record is enriched with:
+    - daily risk-engineered features from the risk sheet, and
+    - static participant metadata from the participants sheet.
+    """
     sheets = pd.read_excel(path, sheet_name=["Participants",
                                              "Daily_Wearable_Data",
                                              "Daily_Risk_Scores"])
@@ -107,17 +114,22 @@ def build_sequence_tensor(df: pd.DataFrame, seq_len: int = SEQ_LEN) -> np.ndarra
     forward-filled from the earliest available day (avoids look-ahead).
     Returns array of shape (n_rows, seq_len, n_channels).
     """
+    # Pre-allocate output for speed and deterministic shape.
     n_rows = len(df)
     n_ch = len(SEQ_CHANNELS)
     seqs = np.zeros((n_rows, seq_len, n_ch), dtype=np.float32)
 
+    # Build windows participant-by-participant so no history ever crosses users.
     for _, group in df.groupby("participant_id", sort=False):
         idx = group.index.to_numpy()
         vals = group[SEQ_CHANNELS].to_numpy(dtype=np.float32)
         for i in range(len(idx)):
+            # Inclusive trailing window ending at day i.
             start = max(0, i - seq_len + 1)
             window = vals[start:i + 1]
             if len(window) < seq_len:                  # pad at the front
+                # Left-pad with earliest available row in this participant timeline,
+                # preserving causality while keeping fixed-length windows.
                 pad = np.repeat(window[:1], seq_len - len(window), axis=0)
                 window = np.vstack([pad, window])
             seqs[idx[i]] = window
@@ -125,7 +137,14 @@ def build_sequence_tensor(df: pd.DataFrame, seq_len: int = SEQ_LEN) -> np.ndarra
 
 
 def build_tabular(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
-    """One-hot encode categoricals + return the tabular feature matrix."""
+    """
+    Build the non-sequential feature block used by XGBoost.
+
+    Steps:
+    1) One-hot encode all categorical static columns.
+    2) Keep predefined numeric columns as-is.
+    3) Concatenate into one dense table and fill numeric NaN values with medians.
+    """
     cat = pd.get_dummies(df[CAT_COLS].astype(str), drop_first=False)
     num = df[NUM_COLS].copy()
     X = pd.concat([num, cat], axis=1)
@@ -144,6 +163,8 @@ class SequenceEncoder(nn.Module):
     """
     def __init__(self, n_channels: int, seq_len: int, embed_dim: int = EMBED_DIM):
         super().__init__()
+        # Two light temporal convolutions capture short local dynamics
+        # (sleep/HR/SpO2 variability patterns) over the 7-day context.
         self.conv = nn.Sequential(
             nn.Conv1d(n_channels, 32, kernel_size=3, padding=1),
             nn.ReLU(),
@@ -151,7 +172,9 @@ class SequenceEncoder(nn.Module):
             nn.ReLU(),
             nn.AdaptiveAvgPool1d(1),                   # → (B, 32, 1)
         )
+        # Small embedding acts as a compact summary for stacking with tabular data.
         self.embed = nn.Linear(32, embed_dim)
+        # Binary head is only used while training the encoder.
         self.head = nn.Linear(embed_dim, 1)
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
@@ -169,6 +192,7 @@ def train_nn(X_seq: np.ndarray, y: np.ndarray, train_idx: np.ndarray,
     participant-disjoint validation slice carved out of the training set.
     """
     # Carve a participant-level validation slice (~20% of train participants).
+    # This avoids temporal/person leakage between train and validation.
     train_p = np.unique(participants[train_idx])
     rng = np.random.default_rng(RANDOM_STATE)
     rng.shuffle(train_p)
@@ -178,6 +202,7 @@ def train_nn(X_seq: np.ndarray, y: np.ndarray, train_idx: np.ndarray,
     val_sub_idx = train_idx[val_mask]
 
     def make_loader(idx, shuffle):
+        # PyTorch Conv1d expects channels-first tensors: (batch, channels, seq_len).
         xt = torch.from_numpy(X_seq[idx]).permute(0, 2, 1)
         yt = torch.from_numpy(y[idx]).float()
         return DataLoader(TensorDataset(xt, yt), batch_size=NN_BATCH, shuffle=shuffle)
@@ -187,6 +212,7 @@ def train_nn(X_seq: np.ndarray, y: np.ndarray, train_idx: np.ndarray,
 
     model = SequenceEncoder(n_channels=len(SEQ_CHANNELS), seq_len=SEQ_LEN)
     opt = torch.optim.Adam(model.parameters(), lr=NN_LR)
+    # Weigh positives more heavily to counter the low alert prevalence.
     loss_fn = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight))
 
     best_val = float("inf")
@@ -196,14 +222,17 @@ def train_nn(X_seq: np.ndarray, y: np.ndarray, train_idx: np.ndarray,
         model.train()
         for xb, yb in train_loader:
             opt.zero_grad()
+            # BCEWithLogitsLoss combines sigmoid + BCE in one numerically stable op.
             loss_fn(model(xb), yb).backward()
             opt.step()
 
         model.eval()
         with torch.no_grad():
+            # Weighted average over validation rows.
             val_loss = sum(loss_fn(model(xb), yb).item() * xb.size(0)
                            for xb, yb in val_loader) / len(val_sub_idx)
         if val_loss < best_val - 1e-4:
+            # Keep an in-memory snapshot of the best checkpoint.
             best_val, best_state, stale = val_loss, {k: v.clone()
                                                      for k, v in model.state_dict().items()}, 0
         else:
@@ -215,13 +244,19 @@ def train_nn(X_seq: np.ndarray, y: np.ndarray, train_idx: np.ndarray,
             print(f"  early stop at epoch {epoch+1}")
             break
 
+    # Restore best validation epoch before returning encoder.
     model.load_state_dict(best_state)
     return model
 
 
 @torch.no_grad()
 def extract_embeddings(model: SequenceEncoder, X_seq: np.ndarray) -> np.ndarray:
-    """Run the encoder over every row and return the embedding matrix."""
+    """
+    Transform every sequence window into learned dense features.
+
+    Returns shape: (n_rows, EMBED_DIM), later concatenated with tabular features
+    for the stacked hybrid model.
+    """
     model.eval()
     xt = torch.from_numpy(X_seq).permute(0, 2, 1)
     emb = model.encode(xt).cpu().numpy()
@@ -232,6 +267,7 @@ def extract_embeddings(model: SequenceEncoder, X_seq: np.ndarray) -> np.ndarray:
 # 4. Evaluation helper
 # ─────────────────────────────────────────────────────────────────────────────
 def report(name: str, y_true: np.ndarray, p: np.ndarray) -> dict:
+    # Report both ranking quality (ROC-AUC/PR-AUC) and thresholded class metrics.
     auc = roc_auc_score(y_true, p)
     ap = average_precision_score(y_true, p)
     print(f"\n── {name} ──")
@@ -250,6 +286,7 @@ def main() -> None:
     df = load_dataset(DATA_PATH)
     print(f"  merged rows: {len(df):,}   participants: {df['participant_id'].nunique()}")
 
+    # Binary target: whether a physician review alert was raised that day.
     y = df["physician_review_alert"].to_numpy(dtype=np.float32)
     print(f"  positive class prevalence: {y.mean():.2%}")
 
@@ -264,6 +301,7 @@ def main() -> None:
     print(f"  tabular : {X_tab.shape}   sequences : {X_seq.shape}")
 
     # Participant-level split — no person appears in both train and test.
+    # This is stricter and more realistic than row-level random splits.
     participants = df["participant_id"].unique()
     train_p, test_p = train_test_split(participants, test_size=0.25,
                                        random_state=RANDOM_STATE)
@@ -272,19 +310,23 @@ def main() -> None:
     print(f"  train rows: {len(train_idx)}   test rows: {len(test_idx)}")
 
     # Standardise sequence channels using training-only stats (no leakage).
+    # We normalize each channel globally over all train windows/timesteps.
     flat_train = X_seq[train_idx].reshape(-1, X_seq.shape[-1])
     seq_mean = flat_train.mean(axis=0)
     seq_std = flat_train.std(axis=0) + 1e-6
     X_seq = (X_seq - seq_mean) / seq_std
 
-    # Scale tabular features (XGBoost is scale-invariant but the
-    # NN-only baseline below benefits from it).
+    # Scale tabular features.
+    # XGBoost itself is mostly scale-invariant, but scaling keeps feature ranges
+    # comparable and is useful if this matrix is reused in linear/NN baselines.
     scaler = StandardScaler().fit(X_tab[train_idx])
     X_tab_s = scaler.transform(X_tab)
 
     pos_weight = (y[train_idx] == 0).sum() / max(1, (y[train_idx] == 1).sum())
     print(f"  scale_pos_weight = {pos_weight:.1f}")
 
+    # Positive-class weighting: negatives / positives in training split.
+    # This gives stronger gradients for rare alert examples.
     # ── train the neural sequence encoder ──────────────────────────────────
     print("\nTraining 1D-CNN sequence encoder…")
     participants_arr = df["participant_id"].to_numpy()
@@ -296,6 +338,7 @@ def main() -> None:
     print(f"  embedding matrix: {emb.shape}")
 
     # ── baseline A: XGBoost on tabular features only ───────────────────────
+    # Serves as a strong non-neural benchmark for mixed clinical/wearable data.
     print("\nTraining baseline XGBoost (tabular only)…")
     xgb_base = xgb.XGBClassifier(
         n_estimators=400, max_depth=4, learning_rate=0.05,
@@ -308,12 +351,14 @@ def main() -> None:
     p_base = xgb_base.predict_proba(X_tab[test_idx])[:, 1]
 
     # ── baseline B: NN-only logits ─────────────────────────────────────────
+    # Measures what sequence dynamics alone can explain.
     with torch.no_grad():
         nn_model.eval()
         logits = nn_model(torch.from_numpy(X_seq[test_idx]).permute(0, 2, 1))
         p_nn = torch.sigmoid(logits).cpu().numpy()
 
     # ── hybrid 1: stacking — XGBoost on [tabular ∪ NN embeddings] ──────────
+    # Combines handcrafted tabular predictors with learned sequence summaries.
     print("Training hybrid XGBoost (tabular + NN embeddings)…")
     X_hyb = np.hstack([X_tab, emb])
     xgb_hyb = xgb.XGBClassifier(
